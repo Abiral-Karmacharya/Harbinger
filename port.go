@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,26 +20,48 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-const (
-	IP            = "127.0.0.1"
-	TIMEOUT       = 200 * time.Millisecond
-	TEMPLUABUFFER = "/tmp/lua_data.json"
-)
-
 type LogConfig struct {
-	Enabled bool   `toml:"enabled"`
-	Path    string `toml:"path"`
+	Enabled bool   `toml:"enabled" json:"enabled"`
+	Path    string `toml:"path" json:"path"`
 }
 
 type Config struct {
+	Scan struct {
+		IP        string `toml:"ip"`
+		TimeoutMS int    `toml:"timeout_ms"`
+		StartPort int    `toml:"start_port"`
+		EndPort   int    `toml:"end_port"`
+		Workers   int    `toml:"workers"`
+	} `toml:"scan"`
+	Paths struct {
+		PortData  string `toml:"port_data" json:"port_data"`
+		LuaData   string `toml:"lua_data" json:"lua_data"`
+		Script    string `toml:"script" json:"script"`
+		Bootstrap string `toml:"bootstrap" json:"bootstrap"`
+		Policy    string `toml:"policy" json:"policy"`
+		Proc      string `toml:"proc" json:"proc"`
+	} `toml:"paths" json:"paths"`
+	Commands struct {
+		Lua  string `toml:"lua"`
+		Lsof string `toml:"lsof"`
+	} `toml:"commands"`
+	Node struct {
+		URL string `toml:"url" json:"url"`
+	} `toml:"node" json:"node"`
 	Logging struct {
-		Enabled bool      `toml:"enabled"`
+		Enabled bool      `toml:"enabled" json:"enabled"`
 		Scan    LogConfig `toml:"scan"`
 		Config  LogConfig `toml:"config"`
 		Node    LogConfig `toml:"node"`
 		Danger  LogConfig `toml:"danger"`
 		Kill    LogConfig `toml:"kill"`
-	} `toml:"logging"`
+		Jester  struct {
+			Enabled        bool   `toml:"enabled" json:"enabled"`
+			Path           string `toml:"path" json:"path"`
+			MaxFileSize    int    `toml:"max_file_size" json:"max_file_size"`
+			MaxBackupIndex int    `toml:"max_backup_index" json:"max_backup_index"`
+		} `toml:"jester" json:"jester"`
+	} `toml:"logging" json:"logging"`
 }
 
 func defaultConfig() Config {
@@ -49,25 +72,37 @@ func defaultConfig() Config {
 	cfg.Logging.Node = LogConfig{Enabled: true}
 	cfg.Logging.Danger = LogConfig{Enabled: true}
 	cfg.Logging.Kill = LogConfig{Enabled: true}
+	cfg.Logging.Jester.Enabled = true
 	return cfg
 }
 
-func loadConfig() (Config, error) {
+func loadConfig(path string) (Config, error) {
 	cfg := defaultConfig()
-	path := "/etc/ace/harbinger/harbinger.toml"
 	data, err := os.ReadFile(path)
 	if err != nil {
-		path = "./harbinger.toml"
-		data, err = os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
-			return cfg, nil
-		}
-		if err != nil {
-			return cfg, err
-		}
+		return cfg, err
 	}
 	if _, err := toml.Decode(string(data), &cfg); err != nil {
 		return cfg, fmt.Errorf("%s: %w", path, err)
+	}
+	if cfg.Scan.StartPort < 1 || cfg.Scan.EndPort > 65535 || cfg.Scan.EndPort < cfg.Scan.StartPort ||
+		cfg.Scan.Workers < 1 || cfg.Scan.Workers > cfg.Scan.EndPort-cfg.Scan.StartPort+1 || cfg.Scan.TimeoutMS < 1 {
+		return cfg, fmt.Errorf("%s: invalid scan range, workers, or timeout_ms", path)
+	}
+	for name, value := range map[string]string{
+		"scan.ip": cfg.Scan.IP, "paths.port_data": cfg.Paths.PortData,
+		"paths.lua_data": cfg.Paths.LuaData, "paths.script": cfg.Paths.Script,
+		"paths.bootstrap": cfg.Paths.Bootstrap, "paths.policy": cfg.Paths.Policy,
+		"paths.proc": cfg.Paths.Proc, "commands.lua": cfg.Commands.Lua,
+		"commands.lsof": cfg.Commands.Lsof, "node.url": cfg.Node.URL,
+	} {
+		if value == "" {
+			return cfg, fmt.Errorf("%s: %s is required", path, name)
+		}
+	}
+	if cfg.Logging.Enabled && cfg.Logging.Jester.Enabled &&
+		(cfg.Logging.Jester.Path == "" || cfg.Logging.Jester.MaxFileSize < 1 || cfg.Logging.Jester.MaxBackupIndex < 1) {
+		return cfg, fmt.Errorf("%s: jester logging requires a path and positive rotation limits", path)
 	}
 	return cfg, nil
 }
@@ -134,7 +169,7 @@ func initLogger(cfg Config) (func(), error) {
 	return cleanup, nil
 }
 
-func activePorts(start int, end int, wg *sync.WaitGroup, p *PortsProcess, mu *sync.RWMutex) {
+func activePorts(start int, end int, wg *sync.WaitGroup, p *PortsProcess, mu *sync.RWMutex, cfg Config) {
 	var (
 		tempGoScanned     = make(map[int]string)
 		tempJsonGoScanned []byte
@@ -142,7 +177,7 @@ func activePorts(start int, end int, wg *sync.WaitGroup, p *PortsProcess, mu *sy
 	defer wg.Done()
 
 	for port := start; port <= end; port++ {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", IP, port), TIMEOUT)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(cfg.Scan.IP, strconv.Itoa(port)), time.Duration(cfg.Scan.TimeoutMS)*time.Millisecond)
 		if err != nil {
 			// connection refused / timeout = expected, not an error worth logging
 			continue
@@ -150,7 +185,7 @@ func activePorts(start int, end int, wg *sync.WaitGroup, p *PortsProcess, mu *sy
 		conn.Close()
 
 		cmd, err := exec.Command(
-			"lsof", "-nP",
+			cfg.Commands.Lsof, "-nP",
 			fmt.Sprintf("-iTCP:%d", port),
 			"-sTCP:LISTEN", "-t",
 		).Output()
@@ -168,7 +203,6 @@ func activePorts(start int, end int, wg *sync.WaitGroup, p *PortsProcess, mu *sy
 	}
 
 	tempJsonGoScanned, err := json.Marshal(tempGoScanned)
-	fmt.Println(tempGoScanned)
 
 	if err != nil {
 		scanLog.Error("failed to marshal scanned ports", "range_start", start, "range_end", end, "err", err)
@@ -199,7 +233,7 @@ func activePorts(start int, end int, wg *sync.WaitGroup, p *PortsProcess, mu *sy
 	}
 }
 
-func runConfig(p *PortsProcess) bool {
+func runConfig(p *PortsProcess, cfg Config) bool {
 	data, err := json.Marshal(map[string]string{
 		"goScanned":   p.goScanned,
 		"nodeScanned": p.nodeScanned,
@@ -209,12 +243,19 @@ func runConfig(p *PortsProcess) bool {
 		panic(err) // config serialization failing = unrecoverable
 	}
 
-	if err := os.WriteFile("/tmp/port_data.json", data, 0644); err != nil {
+	if err := os.WriteFile(cfg.Paths.PortData, data, 0644); err != nil {
 		configLog.Error("failed to write port_data.json", "err", err)
 		panic(err) // lua script needs this file
 	}
 
-	cmd := exec.Command("lua", "/home/abiralk/personal_programs/court/jester/script.lua")
+	configData, err := json.Marshal(cfg)
+	if err != nil {
+		configLog.Error("failed to marshal shared config", "err", err)
+		panic(err)
+	}
+	cmd := exec.Command(cfg.Commands.Lua, cfg.Paths.Script)
+	// Jester uses the same decoded TOML without needing a second TOML parser.
+	cmd.Env = append(os.Environ(), "JESTER_CONFIG="+string(configData))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -224,8 +265,8 @@ func runConfig(p *PortsProcess) bool {
 	return true
 }
 
-func readUncontrolledPorts() {
-	data, err := os.ReadFile(TEMPLUABUFFER)
+func readUncontrolledPorts(cfg Config) {
+	data, err := os.ReadFile(cfg.Paths.LuaData)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			configLog.Debug("lua_data.json not found, skipping uncontrolled ports")
@@ -234,7 +275,7 @@ func readUncontrolledPorts() {
 		configLog.Error("failed to read lua_data.json", "err", err)
 		return
 	}
-	err = os.Remove(TEMPLUABUFFER)
+	err = os.Remove(cfg.Paths.LuaData)
 	if err != nil {
 		configLog.Error("failed to remove file", "err", err)
 	}
@@ -247,7 +288,7 @@ func readUncontrolledPorts() {
 
 	for port, action := range parsedUncontrolledPorts {
 		pidBytes, err := exec.Command(
-			"lsof", "-nP",
+			cfg.Commands.Lsof, "-nP",
 			fmt.Sprintf("-iTCP:%s", port),
 			"-sTCP:LISTEN", "-t",
 		).Output()
@@ -287,10 +328,10 @@ func readUncontrolledPorts() {
 	}
 }
 
-func runNode(wg *sync.WaitGroup, p *PortsProcess) {
+func runNode(wg *sync.WaitGroup, p *PortsProcess, cfg Config) {
 	defer wg.Done()
 
-	res, err := http.Get("http://localhost:3178/api/lua")
+	res, err := http.Get(cfg.Node.URL)
 	if err != nil {
 		nodeLog.Error("failed to reach node API", "err", err)
 		return
@@ -312,7 +353,9 @@ func runNode(wg *sync.WaitGroup, p *PortsProcess) {
 }
 
 func main() {
-	cfg, err := loadConfig()
+	configPath := flag.String("config", "harbinger.toml", "path to the shared Harbinger/Jester TOML config")
+	flag.Parse()
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
@@ -330,10 +373,10 @@ func main() {
 		openPorts = PortsProcess{}
 	)
 
-	const (
-		startPort  = 2000
-		endPort    = 65535
-		workers    = 1000
+	var (
+		startPort  = cfg.Scan.StartPort
+		endPort    = cfg.Scan.EndPort
+		workers    = cfg.Scan.Workers
 		totalPorts = endPort - startPort + 1
 		perWorker  = totalPorts / workers
 	)
@@ -345,15 +388,15 @@ func main() {
 			end = endPort
 		}
 		wg.Add(1)
-		go activePorts(start, end, &wg, &openPorts, &mu)
+		go activePorts(start, end, &wg, &openPorts, &mu, cfg)
 	}
 
 	wg.Add(1)
-	go runNode(&wg, &openPorts)
+	go runNode(&wg, &openPorts, cfg)
 	wg.Wait()
-	config_status := runConfig(&openPorts)
+	config_status := runConfig(&openPorts, cfg)
 	if config_status == false {
 		return
 	}
-	readUncontrolledPorts()
+	readUncontrolledPorts(cfg)
 }

@@ -1,0 +1,55 @@
+# Run with: ./port -config /path/to/harbinger.toml
+# Relative paths resolve from the working directory of Harbinger and Jester.
+# Jester receives these same settings from Harbinger.
+[scan]
+ip = "127.0.0.1"
+timeout_ms = 200
+start_port = 2000
+end_port = 65535
+workers = 1000
+
+[paths]
+port_data = "/tmp/port_data.json"
+lua_data = "/tmp/lua_data.json"
+script = "./jester/script.lua"
+bootstrap = "./jester/bootstrap.lua"
+# Rules retain the existing Port(...) / Default Lua syntax.
+policy = "./jester/policy.lua"
+proc = "/proc"
+
+[commands]
+lua = "lua"
+lsof = "lsof"
+
+[node]
+url = "http://localhost:3178/api/lua"
+
+[logging]
+# This switch controls logging in both Harbinger and Jester.
+enabled = true
+
+[logging.scan]
+enabled = true
+path = "/var/log/ace/harbinger/port_scanner.log"
+
+[logging.config]
+enabled = true
+path = "/var/log/ace/harbinger/config_file.log"
+
+[logging.node]
+enabled = true
+path = "/var/log/ace/harbinger/node_file.log"
+
+[logging.danger]
+enabled = true
+path = "/var/log/ace/harbinger/danger_port.log"
+
+[logging.kill]
+enabled = true
+path = "/var/log/ace/harbinger/kill_port.log"
+
+[logging.jester]
+enabled = true
+path = "/var/log/ace/jester/port_scanner_policy.log"
+max_file_size = 1048576
+max_backup_index = 5
